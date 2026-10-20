@@ -9,15 +9,19 @@
  */
 
 import { decodificar, tramaSync, type TramaEntrante } from './protocolo.js';
+import { TransporteHttp } from './transporte-http.js';
 
 export interface Transporte {
-  readonly modo: 'serial' | 'simulador';
+  readonly modo: 'serial' | 'simulador' | 'http';
   conectar(): Promise<void>;
   enviar(trama: string): void;
   alRecibir(manejador: (t: TramaEntrante) => void): void;
   /** Solo tiene efecto en el simulador. */
   moverVehiculo?(indice: number, presente: boolean): void;
   presionarBoton?(): void;
+  /** Solo existe en maquetas con talanquera (transporte http). */
+  abrirPaso?(mensaje?: string): void;
+  cerrarPaso?(): void;
 }
 
 // =====================================================================
@@ -130,10 +134,17 @@ export class SimuladorArduino implements Transporte {
 
 export function crearTransporte(): Transporte {
   const modo = process.env.MODO_HARDWARE ?? 'simulador';
+
   if (modo === 'serial') {
     const ruta = process.env.PUERTO_SERIAL ?? '/dev/ttyACM0';
     const baudios = Number(process.env.BAUDIOS ?? 115200);
     return new ArduinoSerial(ruta, baudios);
   }
-  return new SimuladorArduino();
+
+  // Maqueta real del grupo: Arduino R4 WiFi que postea por HTTP.
+  if (modo === 'http') {
+    return new TransporteHttp();
+  }
+
+  return new SimuladorArduino(Number(process.env.ESPACIOS ?? 10));
 }

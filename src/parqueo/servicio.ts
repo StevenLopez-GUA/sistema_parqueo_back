@@ -7,7 +7,11 @@
  *     ^                                        |
  *     |                             AUTORIZAR_SALIDA
  *     |                                        v
- *     +--------------SALIDA--------------- AUTORIZADO
+ *     +----(el vehiculo sale: automatico)-- AUTORIZADO
+ *
+ *   Con la salida autorizada, cuando el sensor deja de detectar el
+ *   vehiculo el espacio queda libre solo. SALIDA(placa) queda en el
+ *   lenguaje como respaldo manual.
  *
  *   OCUPADO --(sensor se libera sin autorizacion)--> ALARMA
  *   ALARMA  --APAGAR_ALARMA--> OCUPADO o LIBRE
@@ -112,7 +116,25 @@ export class ServicioParqueo {
   asignar(placa: string): string {
     const espacio = this.mejorEspacioPara(placa);
     if (!espacio) throw new Error(`No hay espacio disponible para la placa ${placa}`);
+    return this.ocuparEspacio(placa, espacio);
+  }
 
+  /**
+   * Igual que ASIGNAR, pero en el espacio que eligio el operador (entrada
+   * desde la camara). El espacio debe estar libre y ser compatible.
+   */
+  asignarEn(placa: string, espacioId: number): string {
+    const vehiculo = this.vehiculoPorPlaca(placa);
+    if (!vehiculo) throw new Error(`La placa ${placa} no esta registrada`);
+    const viva = this.ocupacionViva(placa);
+    if (viva) throw new Error(`La placa ${placa} ya tiene asignado el espacio ${viva.espacio}`);
+
+    const espacio = this.espaciosCompatibles(vehiculo.tipo, placa).find((e) => e.id === espacioId);
+    if (!espacio) throw new Error('El espacio elegido no esta libre o no es compatible con ese vehiculo');
+    return this.ocuparEspacio(placa, espacio);
+  }
+
+  private ocuparEspacio(placa: string, espacio: { id: number; codigo: string }): string {
     const vehiculo = this.vehiculoPorPlaca(placa)!;
 
     const tx = db.transaction(() => {
@@ -123,6 +145,9 @@ export class ServicioParqueo {
       this.cambiarEstadoEspacio(espacio.id, 'ASIGNADO');
     });
     tx();
+
+    // Con maqueta de talanquera, asignar un espacio autoriza la entrada.
+    this.hardware.abrirPaso?.(`Ingrese al espacio ${espacio.codigo}`);
 
     this.registrarEvento(`${placa} asignado al espacio ${espacio.codigo}`, 'info');
     this.notificar();
@@ -141,6 +166,9 @@ export class ServicioParqueo {
     });
     tx();
 
+    // El vehiculo ya esta adentro y parqueado: el transito termino.
+    this.hardware.cerrarPaso?.();
+
     this.registrarEvento(`${placa} ocupo el espacio ${oc.espacio} — seguridad activa`, 'info');
     this.notificar();
     return `Llegada confirmada en ${oc.espacio}. Sistema de seguridad activado`;
@@ -158,6 +186,8 @@ export class ServicioParqueo {
     });
     tx();
 
+    this.hardware.abrirPaso?.(`Salida autorizada: ${placa}`);
+
     this.registrarEvento(`Salida autorizada para ${placa} en ${oc.espacio}`, 'info');
     this.notificar();
     return `Salida autorizada para ${placa}. Ya puede retirar el vehiculo de ${oc.espacio}`;
@@ -165,15 +195,10 @@ export class ServicioParqueo {
 
   salida(placa: string): string {
     const oc = this.ocupacionViva(placa)!;
-    const tx = db.transaction(() => {
-      db.prepare(
-        `UPDATE ocupacion
-            SET estado = 'FINALIZADA', salida_en = datetime('now','localtime')
-          WHERE id = ?`
-      ).run(oc.ocupacion_id);
-      this.cambiarEstadoEspacio(oc.espacio_id, 'LIBRE');
-    });
-    tx();
+    this.finalizarOcupacion(oc.ocupacion_id, oc.espacio_id);
+
+    // El vehiculo ya salio: se consume el permiso de la talanquera.
+    this.hardware.cerrarPaso?.();
 
     this.registrarEvento(`${placa} salio. ${oc.espacio} disponible`, 'info');
     this.notificar();
@@ -217,6 +242,47 @@ export class ServicioParqueo {
       : `Alarma apagada. ${placa} sigue en ${fila.espacio}`;
   }
 
+  /**
+   * Alarma sin placa (alguien se estaciono en un espacio libre sin estar
+   * registrado): no hay placa con la cual apagarla, asi que se apaga por
+   * espacio. El espacio queda libre; si el vehiculo sigue ahi, el operador
+   * puede registrarlo.
+   */
+  apagarAlarmaDeEspacio(espacioId: number): string {
+    const fila = db
+      .prepare(
+        `SELECT a.id, e.codigo, e.sensor_ocupado
+           FROM alarma a
+           JOIN espacio e ON e.id = a.espacio_id
+          WHERE a.espacio_id = ? AND a.apagada_en IS NULL AND a.ocupacion_id IS NULL`
+      )
+      .get(espacioId) as { id: number; codigo: string; sensor_ocupado: number } | undefined;
+    if (!fila) throw new Error('Ese espacio no tiene una alarma sin placa activa');
+
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE alarma
+            SET apagada_en = datetime('now','localtime'), apagada_por = 'OPERADOR'
+          WHERE id = ?`
+      ).run(fila.id);
+      this.cambiarEstadoEspacio(espacioId, 'LIBRE');
+    })();
+
+    this.sincronizarSirena();
+    this.registrarEvento(`Alarma de ${fila.codigo} (vehiculo no registrado) desactivada por el operador`, 'info');
+    this.anotarBitacora({
+      origen: 'SISTEMA',
+      resultado: 'OK',
+      mensaje: `Alarma sin placa de ${fila.codigo} apagada por el operador`,
+      espacio_id: espacioId,
+    });
+    this.notificar();
+
+    return fila.sensor_ocupado
+      ? `Alarma apagada. ${fila.codigo} quedo libre, pero el sensor sigue detectando un vehiculo: registrelo si se va a quedar`
+      : `Alarma apagada. ${fila.codigo} quedo libre`;
+  }
+
   consultar(): FilaEstado[] {
     return this.estado();
   }
@@ -252,7 +318,50 @@ export class ServicioParqueo {
       this.dispararAlarma(espacio.id, 'OCUPACION_NO_REGISTRADA');
     }
 
+    // CASO 3: salida autorizada y el vehiculo dejo el espacio: queda libre.
+    if (!ocupado && espacio.estado === 'AUTORIZADO') {
+      this.liberarAlSalir(espacio.id);
+    }
+
     this.notificar();
+  }
+
+  /**
+   * El vehiculo con salida autorizada dejo su espacio. El permiso de la
+   * talanquera NO se cierra aqui: el vehiculo todavia tiene que cruzarla
+   * (lo consume el ultrasonico al pasar, o vence solo).
+   */
+  private liberarAlSalir(espacioId: number): void {
+    const oc = db
+      .prepare(
+        `SELECT o.id, v.placa, e.codigo
+           FROM ocupacion o
+           JOIN vehiculo v ON v.id = o.vehiculo_id
+           JOIN espacio  e ON e.id = o.espacio_id
+          WHERE o.espacio_id = ? AND o.estado = 'AUTORIZADO'`
+      )
+      .get(espacioId) as { id: number; placa: string; codigo: string } | undefined;
+    if (!oc) return;
+
+    this.finalizarOcupacion(oc.id, espacioId);
+    this.registrarEvento(`${oc.placa} salio. ${oc.codigo} disponible`, 'info');
+    this.anotarBitacora({
+      origen: 'SENSOR',
+      resultado: 'OK',
+      mensaje: `Salida de ${oc.placa}: ${oc.codigo} liberado automaticamente`,
+      espacio_id: espacioId,
+    });
+  }
+
+  private finalizarOcupacion(ocupacionId: number, espacioId: number): void {
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE ocupacion
+            SET estado = 'FINALIZADA', salida_en = datetime('now','localtime')
+          WHERE id = ?`
+      ).run(ocupacionId);
+      this.cambiarEstadoEspacio(espacioId, 'LIBRE');
+    })();
   }
 
   /** Boton fisico: autoriza la salida del espacio seleccionado en la consola. */
@@ -413,6 +522,92 @@ export class ServicioParqueo {
           sensor_ocupado: number;
         }
       | undefined;
+  }
+
+  /**
+   * Espacios libres donde puede ir un vehiculo de ese tipo, del mejor al
+   * peor. Mismas reglas que la asignacion automatica (compatibilidad y
+   * reservas), pero sin elegir: la entrada desde la camara deja escoger.
+   */
+  espaciosCompatibles(tipoVehiculo: string, placa: string) {
+    return db
+      .prepare(
+        `SELECT e.id, e.codigo
+           FROM espacio e
+           JOIN tipo_espacio   te ON te.id = e.tipo_espacio_id
+           JOIN compatibilidad c  ON c.tipo_espacio_id = e.tipo_espacio_id
+           JOIN tipo_vehiculo  tv ON tv.id = c.tipo_vehiculo_id AND tv.codigo = @tipo
+          WHERE e.estado = 'LIBRE'
+            AND (
+                  te.requiere_reserva = 0
+                  OR EXISTS (SELECT 1 FROM reserva r
+                              WHERE r.espacio_id = e.id
+                                AND r.activa = 1
+                                AND r.placa = @placa)
+                )
+          ORDER BY c.prioridad ASC, e.codigo ASC`
+      )
+      .all({ tipo: tipoVehiculo, placa }) as { id: number; codigo: string }[];
+  }
+
+  // ==================================================================
+  // Espacios privados (reservas)
+  // ==================================================================
+
+  /** Reservas activas: que placa puede usar cada espacio privado. */
+  reservas() {
+    return db
+      .prepare(
+        `SELECT r.espacio_id, e.codigo AS espacio, r.placa, r.creada_en
+           FROM reserva r
+           JOIN espacio e ON e.id = r.espacio_id
+          WHERE r.activa = 1
+          ORDER BY e.codigo`
+      )
+      .all() as { espacio_id: number; espacio: string; placa: string; creada_en: string }[];
+  }
+
+  /**
+   * Autoriza una placa en un espacio privado. Reemplaza a la placa anterior
+   * de ese espacio y, si la placa tenia otro privado, lo libera: un
+   * vehiculo, un espacio privado.
+   */
+  reservar(espacioId: number, placa: string): string {
+    const espacio = db
+      .prepare(
+        `SELECT e.id, e.codigo, te.requiere_reserva
+           FROM espacio e JOIN tipo_espacio te ON te.id = e.tipo_espacio_id
+          WHERE e.id = ?`
+      )
+      .get(espacioId) as { id: number; codigo: string; requiere_reserva: number } | undefined;
+    if (!espacio) throw new Error('El espacio no existe');
+    if (!espacio.requiere_reserva) throw new Error(`${espacio.codigo} no es un espacio privado`);
+
+    db.transaction(() => {
+      db.prepare('UPDATE reserva SET activa = 0 WHERE activa = 1 AND (espacio_id = ? OR placa = ?)').run(espacio.id, placa);
+      db.prepare('INSERT INTO reserva (espacio_id, placa) VALUES (?, ?)').run(espacio.id, placa);
+    })();
+
+    const mensaje = `${espacio.codigo} reservado para ${placa}`;
+    this.registrarEvento(mensaje, 'info');
+    this.notificar();
+    return mensaje;
+  }
+
+  quitarReserva(espacioId: number): string {
+    const r = db
+      .prepare(
+        `SELECT r.id, r.placa, e.codigo FROM reserva r JOIN espacio e ON e.id = r.espacio_id
+          WHERE r.espacio_id = ? AND r.activa = 1`
+      )
+      .get(espacioId) as { id: number; placa: string; codigo: string } | undefined;
+    if (!r) throw new Error('Ese espacio no tiene placa autorizada');
+
+    db.prepare('UPDATE reserva SET activa = 0 WHERE id = ?').run(r.id);
+    const mensaje = `${r.codigo} ya no esta reservado para ${r.placa}`;
+    this.registrarEvento(mensaje, 'info');
+    this.notificar();
+    return mensaje;
   }
 
   /** La consulta de asignacion automatica del enunciado, completa. */

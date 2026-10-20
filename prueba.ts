@@ -11,6 +11,7 @@ import { ServicioParqueo } from './src/parqueo/servicio.js';
 import { Interprete } from './src/lenguaje/interprete.js';
 import { SimuladorArduino } from './src/hardware/transporte.js';
 import { reiniciarParqueo } from './src/db/db.js';
+import { ServicioCaptura } from './src/camara/servicio-captura.js';
 
 const sim = new SimuladorArduino();
 const servicio = new ServicioParqueo(sim);
@@ -115,13 +116,15 @@ esperar(
   'bloquea la salida si el sensor sigue detectando el vehiculo'
 );
 
+// Con la salida autorizada, al irse el vehiculo el espacio se libera solo.
+console.log('\n=== El vehiculo sale con autorizacion ===');
 sim.moverVehiculo(8, false);
-correr('Salida correcta', 'SALIDA(M456XYZ);');
 esperar(!sim.alarmaEncendida, 'salir con autorizacion NO dispara alarma');
 esperar(
   servicio.estado().find((f) => f.espacio === 'E09')?.estado === 'LIBRE',
-  'el espacio de moto quedo disponible'
+  'el espacio de moto quedo disponible sin ejecutar SALIDA'
 );
+esperar(!servicio.ocupacionViva('M456XYZ'), 'la ocupacion de la moto quedo finalizada');
 
 // ---------------------------------------------------------------------
 // 5. Reservas y compatibilidad
@@ -135,6 +138,44 @@ esperar(
 
 const consulta = correr('Consultar', 'CONSULTAR();');
 esperar((consulta.salidas[0]?.tabla?.length ?? 0) === 10, 'CONSULTAR devuelve los 10 espacios');
+
+// ---------------------------------------------------------------------
+// 6. Alarma sin placa: se apaga por espacio
+// ---------------------------------------------------------------------
+
+console.log('\n=== Alarma de vehiculo no registrado ===');
+reiniciarParqueo();
+sim.moverVehiculo(9, true); // alguien se estaciona en E10, libre
+esperar(servicio.estado().find((f) => f.espacio === 'E10')?.estado === 'ALARMA', 'estacionarse sin registro dispara la alarma');
+sim.moverVehiculo(9, false); // y se va
+esperar(servicio.estado().find((f) => f.espacio === 'E10')?.estado === 'ALARMA', 'la alarma sigue aunque el vehiculo se fue');
+const idE10 = servicio.estado().find((f) => f.espacio === 'E10')!.espacio_id;
+const msgApagar = servicio.apagarAlarmaDeEspacio(idE10);
+console.log('  ', msgApagar);
+esperar(servicio.estado().find((f) => f.espacio === 'E10')?.estado === 'LIBRE', 'el operador la apaga por espacio y E10 queda libre');
+esperar(!sim.alarmaEncendida, 'la sirena se apaga');
+
+// ---------------------------------------------------------------------
+// 7. Reiniciar con capturas vinculadas a un vehiculo
+// ---------------------------------------------------------------------
+
+console.log('\n=== Reiniciar con capturas ===');
+const capturas = new ServicioCaptura();
+// JPEG minimo valido (1x1): basta para guardar el archivo.
+const JPEG_1X1 =
+  '/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAMCAgICAgMCAgIDAwMDBAYEBAQEBAgGBgUGCQgKCgkICQkKDA8MCgsOCwkJDRENDg8QEBEQCgwSExIQEw8QEBD/yQALCAABAAEBAREA/8wABgAQEAX/2gAIAQEAAD8A0s8g/9k=';
+const captura = capturas.guardar({ imagen: JPEG_1X1, motivo: 'REGISTRO', placaConfirmada: 'G111AAA', metodoLectura: 'MANUAL' }) as {
+  id: number;
+};
+let reinicioOk = true;
+try {
+  reiniciarParqueo();
+} catch (e) {
+  reinicioOk = false;
+  console.log('  ', e);
+}
+esperar(reinicioOk, 'reiniciar no falla aunque una captura apunte al vehiculo');
+esperar(!!capturas.porId(captura.id), 'la captura se conserva despues de reiniciar');
 
 // ---------------------------------------------------------------------
 

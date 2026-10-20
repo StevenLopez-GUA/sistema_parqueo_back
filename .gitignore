@@ -51,3 +51,12 @@ thumb
 sketch
 
 # End of https://www.toptal.com/developers/gitignore/api/react,macos
+### proyecto ###
+.env
+dist/
+capturas/
+respaldo-original/
+# La BD se comparte como script: src/db/sqlserver/*.sql (npm run bd:sqlserver)
+*.db
+*.db-wal
+*.db-shm

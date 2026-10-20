@@ -5,13 +5,15 @@
   "type": "module",
   "description": "Sistema Inteligente de Parqueo - backend, interprete y puente con la maqueta",
   "scripts": {
-    "dev": "PATH=\"/opt/homebrew/opt/node@22/bin:$PATH\" tsx watch src/servidor.ts",
-    "start": "PATH=\"/opt/homebrew/opt/node@22/bin:$PATH\" tsx src/servidor.ts",
-    "build": "PATH=\"/opt/homebrew/opt/node@22/bin:$PATH\" tsc",
-    "bd:reset": "node -e \"require('fs').rmSync('parqueo.db',{force:true});require('fs').rmSync('parqueo.db-wal',{force:true});require('fs').rmSync('parqueo.db-shm',{force:true});console.log('base de datos borrada')\""
-  },
-  "engines": {
-    "node": "22.x"
+    "dev": "tsx watch src/servidor.ts",
+    "start": "tsx src/servidor.ts",
+    "build": "tsc",
+    "bd:reset": "node -e \"require('fs').rmSync('parqueo.db',{force:true});require('fs').rmSync('parqueo.db-wal',{force:true});require('fs').rmSync('parqueo.db-shm',{force:true});console.log('base de datos borrada')\"",
+    "bd:maqueta": "node src/db/cargar_maqueta.cjs",
+    "prueba": "tsx prueba.ts",
+    "prueba:camara": "tsx prueba-camara.ts",
+    "prueba:http": "tsx prueba-http.ts",
+    "bd:sqlserver": "node src/db/exportar_sqlserver.cjs"
   },
   "dependencies": {
     "better-sqlite3": "^11.5.0",
